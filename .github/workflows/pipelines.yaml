@@ -1,0 +1,176 @@
+name: Trigger AWS CodePipelines (boto3, continue on failure, emoji summary)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pipelines:
+        description: "Comma-separated list of pipelines, or 'all' to fetch -customization-pipeline"
+        required: true
+      arg1:
+        description: "Boolean arg1"
+        type: boolean
+        default: true
+      arg2:
+        description: "Boolean arg2"
+        type: boolean
+        default: false
+      arg3:
+        description: "Boolean arg3"
+        type: boolean
+        default: true
+      arg4:
+        description: "Boolean arg4"
+        type: boolean
+        default: false
+      arg5:
+        description: "Boolean arg5"
+        type: boolean
+        default: true
+      timeout_minutes:
+        description: "Max minutes to wait for a pipeline to finish"
+        type: number
+        default: 30
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.collect.outputs.matrix }}
+      params: ${{ steps.collect.outputs.params }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ap-southeast-2
+          role-to-assume: arn:aws:iam::123456789012:role/GitHubActionsRole
+
+      - name: Install Python dependencies
+        run: pip install boto3
+
+      - name: Collect pipelines and parameters
+        id: collect
+        run: |
+          python <<'PYCODE'
+          import boto3, json, os
+
+          input_val = "${{ github.event.inputs.pipelines }}".strip()
+          client = boto3.client("codepipeline", region_name="ap-southeast-2")
+
+          # Collect pipelines
+          if input_val.lower() == "all":
+              paginator = client.get_paginator("list_pipelines")
+              pipelines = []
+              for page in paginator.paginate():
+                  for p in page["pipelines"]:
+                      name = p["name"]
+                      if "-customization-pipeline" in name:
+                          pipelines.append(name)
+          else:
+              pipelines = [p.strip() for p in input_val.split(",") if p.strip()]
+
+          # Deduplicate
+          pipelines = list(dict.fromkeys(pipelines))
+          if not pipelines:
+              raise SystemExit("❌ No pipelines found!")
+
+          # Shared boolean parameters
+          args = [
+              {"name":"arg1","value":str("${{ github.event.inputs.arg1 }}").lower()},
+              {"name":"arg2","value":str("${{ github.event.inputs.arg2 }}").lower()},
+              {"name":"arg3","value":str("${{ github.event.inputs.arg3 }}").lower()},
+              {"name":"arg4","value":str("${{ github.event.inputs.arg4 }}").lower()},
+              {"name":"arg5","value":str("${{ github.event.inputs.arg5 }}").lower()},
+          ]
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"matrix={json.dumps(pipelines)}\n")
+              f.write(f"params={json.dumps(args)}\n")
+          print("Collected pipelines:", pipelines)
+          print("Parameters:", args)
+          PYCODE
+
+  trigger:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        pipeline: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+      max-parallel: 5
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ap-southeast-2
+          role-to-assume: arn:aws:iam::123456789012:role/GitHubActionsRole
+
+      - name: Install Python dependencies
+        run: pip install boto3
+
+      - name: Start and track pipeline execution with timeout and emoji summary
+        shell: bash
+        run: |
+          python <<'PYCODE'
+          import boto3, json, os, time
+
+          pipeline_name = "${{ matrix.pipeline }}"
+          params = json.loads('${{ needs.prepare.outputs.params }}')
+          timeout_minutes = int("${{ github.event.inputs.timeout_minutes }}")
+          timeout_seconds = timeout_minutes * 60
+
+          client = boto3.client("codepipeline", region_name="ap-southeast-2")
+
+          # Start pipeline
+          try:
+              response = client.start_pipeline_execution(
+                  name=pipeline_name,
+                  pipelineParameters=params
+              )
+              exec_id = response["pipelineExecutionId"]
+              print(f"✅ Started pipeline {pipeline_name} (exec {exec_id})")
+          except Exception as e:
+              exec_id = "N/A"
+              print(f"⚠️ Failed to start {pipeline_name}: {e}")
+
+          start_time = time.time()
+          started_flag = False
+          final_status = "⚠️ Failed to start" if exec_id == "N/A" else None
+
+          while final_status is None:
+              elapsed = time.time() - start_time
+              if elapsed > timeout_seconds:
+                  final_status = "⏰ Timeout"
+                  print(f"⏰ Timeout waiting for {pipeline_name} (>{timeout_minutes} min)")
+
+              if exec_id != "N/A":
+                  try:
+                      status = client.get_pipeline_execution(
+                          pipelineName=pipeline_name,
+                          pipelineExecutionId=exec_id
+                      )["pipelineExecution"]["status"]
+                  except Exception as e:
+                      print(f"Error fetching status for {pipeline_name}: {e}")
+                      time.sleep(5)
+                      continue
+
+                  if status == "InProgress" and not started_flag:
+                      print(f"🎉 {pipeline_name} entered InProgress")
+                      started_flag = True
+
+                  # Map AWS status to emoji
+                  if status == "Succeeded":
+                      final_status = "✅ Succeeded"
+                  elif status == "Failed":
+                      final_status = "❌ Failed"
+                  elif status == "Stopped":
+                      final_status = "⏹️ Stopped"
+
+              time.sleep(10)
+
+          # Write final status to GitHub summary
+          with open(os.environ.get("GITHUB_STEP_SUMMARY"), "a") as f:
+              f.write(f"### {pipeline_name}\n")
+              f.write(f"- Execution ID: `{exec_id}`\n")
+              f.write(f"- Status: {final_status}\n")
+
+          print(f"Pipeline {pipeline_name} final status: {final_status}")
+          PYCODE
