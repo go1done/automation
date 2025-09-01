@@ -1,0 +1,47 @@
+name: "Assume AWS Role"
+description: "Assume an AWS IAM role and expose temporary credentials"
+author: "Your Name"
+runs:
+  using: "composite"
+  steps:
+    - name: Assume AWS Role
+      shell: bash
+      run: |
+        set -e
+
+        ROLE_ARN="arn:aws:iam::${{ inputs.account_id }}:role/${{ inputs.role_name }}"
+        echo "Assuming role: $ROLE_ARN in region ${{ inputs.region }}"
+
+        CREDS_JSON=$(aws sts assume-role \
+          --role-arn "$ROLE_ARN" \
+          --role-session-name "${{ inputs.session_name }}" \
+          --region "${{ inputs.region }}" \
+          --output json)
+
+        AWS_ACCESS_KEY_ID=$(echo $CREDS_JSON | jq -r '.Credentials.AccessKeyId')
+        AWS_SECRET_ACCESS_KEY=$(echo $CREDS_JSON | jq -r '.Credentials.SecretAccessKey')
+        AWS_SESSION_TOKEN=$(echo $CREDS_JSON | jq -r '.Credentials.SessionToken')
+
+        # Write credentials to GitHub environment for later steps
+        echo "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID" >> $GITHUB_ENV
+        echo "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY" >> $GITHUB_ENV
+        echo "AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN" >> $GITHUB_ENV
+        echo "AWS_REGION=${{ inputs.region }}" >> $GITHUB_ENV
+
+        echo "✅ Role assumed successfully"
+
+inputs:
+  role_name:
+    description: "Name of the role to assume"
+    required: true
+  account_id:
+    description: "AWS account number"
+    required: true
+  session_name:
+    description: "Session name for STS"
+    required: false
+    default: "GitHubSession"
+  region:
+    description: "AWS region for the role"
+    required: false
+    default: "ap-southeast-2"
