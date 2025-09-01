@@ -1,0 +1,98 @@
+name: Run Pipelines with Approval
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - Dev
+          - Production
+      pipelines:
+        description: "Comma-separated list of pipelines (or 'all')"
+        required: true
+        default: "all"
+      arg1:
+        type: boolean
+        default: false
+      arg2:
+        type: boolean
+        default: false
+      arg3:
+        type: boolean
+        default: false
+      arg4:
+        type: boolean
+        default: false
+      arg5:
+        type: boolean
+        default: false
+
+jobs:
+  trigger:
+    # 👇 Require approval only in Production
+    environment: ${{ github.event.inputs.environment }}
+    runs-on: ubuntu-latest
+    outputs:
+      pipelines: ${{ steps.collect.outputs.pipelines }}
+      account: ${{ steps.set-account.outputs.account }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set AWS Account ID
+        id: set-account
+        run: |
+          if [ "${{ github.event.inputs.environment }}" = "Production" ]; then
+            echo "account=222222222222" >> $GITHUB_OUTPUT
+          else
+            echo "account=111111111111" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ap-southeast-2
+          role-to-assume: arn:aws:iam::${{ steps.set-account.outputs.account }}:role/GitHubActionsRole
+
+      - name: Collect pipelines
+        id: collect
+        run: |
+          if [ "${{ github.event.inputs.pipelines }}" = "all" ]; then
+            aws codepipeline list-pipelines \
+              --query 'pipelines[?contains(name, `-customization-pipeline`)].name' \
+              --output json > pipelines.json
+          else
+            echo "${{ github.event.inputs.pipelines }}" | tr ',' '\n' | jq -R . | jq -s . > pipelines.json
+          fi
+          echo "pipelines=$(cat pipelines.json | jq -c .)" >> $GITHUB_OUTPUT
+
+  run-pipelines:
+    needs: trigger
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 2   # 👈 avoid AWS throttling
+      matrix:
+        pipeline: ${{ fromJson(needs.trigger.outputs.pipelines) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ap-southeast-2
+          role-to-assume: arn:aws:iam::${{ needs.trigger.outputs.account }}:role/GitHubActionsRole
+
+      - name: Start pipeline
+        run: |
+          echo "🚀 Starting pipeline: ${{ matrix.pipeline }}"
+          aws codepipeline start-pipeline-execution \
+            --name "${{ matrix.pipeline }}" \
+            --pipeline-parameters \
+              name=arg1,value=${{ github.event.inputs.arg1 }} \
+              name=arg2,value=${{ github.event.inputs.arg2 }} \
+              name=arg3,value=${{ github.event.inputs.arg3 }} \
+              name=arg4,value=${{ github.event.inputs.arg4 }} \
+              name=arg5,value=${{ github.event.inputs.arg5 }}
