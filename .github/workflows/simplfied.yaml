@@ -1,0 +1,128 @@
+name: Trigger AWS CodePipelines (simplified)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment (Dev or Production)"
+        required: true
+        default: "Dev"
+        type: choice
+        options: [Dev, Production]
+      pipelines:
+        description: "Comma-separated list of pipelines, or 'all' to fetch -customization-pipeline"
+        required: true
+      arg1: {description: "Boolean arg1", type: boolean, default: true}
+      arg2: {description: "Boolean arg2", type: boolean, default: false}
+      arg3: {description: "Boolean arg3", type: boolean, default: true}
+      arg4: {description: "Boolean arg4", type: boolean, default: false}
+      arg5: {description: "Boolean arg5", type: boolean, default: true}
+      timeout_minutes:
+        description: "Max minutes to wait for a pipeline to finish"
+        type: number
+        default: 30
+
+jobs:
+  trigger:
+    environment: ${{ github.event.inputs.environment }}
+    runs-on: ubuntu-latest
+    outputs:
+      results: ${{ steps.runpipeline.outputs.results }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ap-southeast-2
+          role-to-assume: arn:aws:iam::123456789012:role/GitHubActionsRole
+
+      - name: Install Python dependencies
+        run: pip install boto3
+
+      - name: Collect & run pipelines
+        id: runpipeline
+        run: |
+          python <<'PYCODE'
+          import boto3, os, sys, time, json
+
+          env = "${{ github.event.inputs.environment }}"
+          if env.lower() == "production" and not os.environ.get("GITHUB_ACTOR"):
+              sys.exit("❌ Production execution not allowed without approval!")
+
+          input_val = "${{ github.event.inputs.pipelines }}".strip()
+          client = boto3.client("codepipeline", region_name="ap-southeast-2")
+
+          if input_val.lower() == "all":
+              pipelines = []
+              for page in client.get_paginator("list_pipelines").paginate():
+                  for p in page["pipelines"]:
+                      if "-customization-pipeline" in p["name"]:
+                          pipelines.append(p["name"])
+          else:
+              pipelines = [p.strip() for p in input_val.split(",") if p.strip()]
+
+          if not pipelines:
+              sys.exit("❌ No pipelines found!")
+
+          args = [
+              {"name":"arg1","value":str("${{ github.event.inputs.arg1 }}").lower()},
+              {"name":"arg2","value":str("${{ github.event.inputs.arg2 }}").lower()},
+              {"name":"arg3","value":str("${{ github.event.inputs.arg3 }}").lower()},
+              {"name":"arg4","value":str("${{ github.event.inputs.arg4 }}").lower()},
+              {"name":"arg5","value":str("${{ github.event.inputs.arg5 }}").lower()},
+          ]
+
+          timeout_minutes = int("${{ github.event.inputs.timeout_minutes }}")
+          timeout_seconds = timeout_minutes * 60
+          results = []
+
+          for pipeline in pipelines:
+              try:
+                  response = client.start_pipeline_execution(
+                      name=pipeline,
+                      pipelineParameters=args
+                  )
+                  exec_id = response["pipelineExecutionId"]
+                  print(f"✅ Started {pipeline} (exec {exec_id})")
+              except Exception as e:
+                  exec_id = "N/A"
+                  results.append({"pipeline": pipeline, "execution_id": exec_id, "status": f"⚠️ Start failed: {e}"})
+                  continue
+
+              start_time = time.time()
+              status = None
+              while True:
+                  if time.time() - start_time > timeout_seconds:
+                      status = "⏰ Timeout"
+                      break
+                  try:
+                      status = client.get_pipeline_execution(
+                          pipelineName=pipeline,
+                          pipelineExecutionId=exec_id
+                      )["pipelineExecution"]["status"]
+                  except Exception as e:
+                      time.sleep(5)
+                      continue
+
+                  if status not in ("InProgress", None):
+                      break
+                  time.sleep(10)
+
+              emoji = {
+                  "Succeeded": "✅ Succeeded",
+                  "Failed": "❌ Failed",
+                  "Stopped": "⏹️ Stopped",
+                  "⏰ Timeout": "⏰ Timeout"
+              }.get(status, status)
+
+              results.append({"pipeline": pipeline, "execution_id": exec_id, "status": emoji})
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"results={json.dumps(results)}\n")
+
+          # Also add to summary
+          print("## 🚦 Pipeline Execution Summary", file=open(os.environ["GITHUB_STEP_SUMMARY"], "a"))
+          print("| Pipeline | Execution ID | Status |", file=open(os.environ["GITHUB_STEP_SUMMARY"], "a"))
+          print("|----------|--------------|--------|", file=open(os.environ["GITHUB_STEP_SUMMARY"], "a"))
+          for r in results:
+              print(f"| {r['pipeline']} | {r['execution_id']} | {r['status']} |", file=open(os.environ["GITHUB_STEP_SUMMARY"], "a"))
+          PYCODE
