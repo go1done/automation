@@ -48,6 +48,14 @@ jobs:
       account: ${{ steps.set-account.outputs.account }}
     steps:
       - uses: actions/checkout@v4
+       - name: Enforce Production Approval
+        if: ${{ github.event.inputs.environment == 'Production' }}
+        run: |
+          if [ -z "$GITHUB_ACTOR" ]; then
+            echo "❌ Production execution blocked: missing actor!"
+            exit 1
+          fi
+          echo "✅ Production execution approved by $GITHUB_ACTOR"
 
       - name: Set AWS Account ID
         id: set-account
