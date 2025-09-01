@@ -1,4 +1,4 @@
-name: Run Pipelines with Approval
+name: Run Pipelines with Approval (Single Job)
 
 on:
   workflow_dispatch:
@@ -31,13 +31,9 @@ on:
         default: false
 
 jobs:
-  trigger:
-    # 👇 Require approval only in Production
+  run-all-pipelines:
     environment: ${{ github.event.inputs.environment }}
     runs-on: ubuntu-latest
-    outputs:
-      pipelines: ${{ steps.collect.outputs.pipelines }}
-      account: ${{ steps.set-account.outputs.account }}
     steps:
       - uses: actions/checkout@v4
 
@@ -66,33 +62,39 @@ jobs:
           else
             echo "${{ github.event.inputs.pipelines }}" | tr ',' '\n' | jq -R . | jq -s . > pipelines.json
           fi
+          echo "Collected pipelines:"
+          cat pipelines.json
           echo "pipelines=$(cat pipelines.json | jq -c .)" >> $GITHUB_OUTPUT
 
-  run-pipelines:
-    needs: trigger
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      max-parallel: 2   # 👈 avoid AWS throttling
-      matrix:
-        pipeline: ${{ fromJson(needs.trigger.outputs.pipelines) }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-region: ap-southeast-2
-          role-to-assume: arn:aws:iam::${{ needs.trigger.outputs.account }}:role/GitHubActionsRole
-
-      - name: Start pipeline
+      - name: Start pipelines sequentially and summarize
         run: |
-          echo "🚀 Starting pipeline: ${{ matrix.pipeline }}"
-          aws codepipeline start-pipeline-execution \
-            --name "${{ matrix.pipeline }}" \
-            --pipeline-parameters \
-              name=arg1,value=${{ github.event.inputs.arg1 }} \
-              name=arg2,value=${{ github.event.inputs.arg2 }} \
-              name=arg3,value=${{ github.event.inputs.arg3 }} \
-              name=arg4,value=${{ github.event.inputs.arg4 }} \
-              name=arg5,value=${{ github.event.inputs.arg5 }}
+          echo "## 🚦 Pipeline Execution Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Pipeline | Execution ID | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------------|--------|" >> $GITHUB_STEP_SUMMARY
+
+          PIPELINES=$(cat pipelines.json | jq -r '.[]')
+
+          for pipeline in $PIPELINES; do
+            echo "⏳ Starting pipeline: $pipeline"
+            exec_id=$(aws codepipeline start-pipeline-execution \
+              --name "$pipeline" \
+              --pipeline-parameters \
+                name=arg1,value=${{ github.event.inputs.arg1 }} \
+                name=arg2,value=${{ github.event.inputs.arg2 }} \
+                name=arg3,value=${{ github.event.inputs.arg3 }} \
+                name=arg4,value=${{ github.event.inputs.arg4 }} \
+                name=arg5,value=${{ github.event.inputs.arg5 }} \
+              --query 'pipelineExecutionId' --output text)
+
+            if [ -z "$exec_id" ]; then
+              status="❌ Failed to start"
+            else
+              status="✅ Started"
+            fi
+
+            echo "- Pipeline: $pipeline"
+            echo "  Execution ID: $exec_id"
+            echo "  Status: $status"
+            echo "| $pipeline | $exec_id | $status |" >> $GITHUB_STEP_SUMMARY
+          done
