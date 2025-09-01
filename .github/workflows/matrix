@@ -1,4 +1,4 @@
-name: Run Pipelines with Approval (Matrix)
+name: Run Pipelines with Approval (Region-aware)
 
 on:
   workflow_dispatch:
@@ -10,6 +10,10 @@ on:
         options:
           - Dev
           - Production
+      region:
+        description: "AWS region where pipelines reside"
+        required: true
+        default: "ap-southeast-2"
       pipelines:
         description: "Comma-separated list of pipelines (or 'all')"
         required: true
@@ -57,14 +61,16 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-region: ap-southeast-2
+          aws-region: ${{ github.event.inputs.region }}
           role-to-assume: arn:aws:iam::${{ steps.set-account.outputs.account }}:role/GitHubActionsRole
 
       - name: Collect pipelines
         id: collect
         run: |
+          REGION=${{ github.event.inputs.region }}
           if [ "${{ github.event.inputs.pipelines }}" = "all" ]; then
             aws codepipeline list-pipelines \
+              --region "$REGION" \
               --query 'pipelines[?contains(name, `-customization-pipeline`)].name' \
               --output json > pipelines.json
           else
@@ -88,14 +94,16 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-region: ap-southeast-2
+          aws-region: ${{ github.event.inputs.region }}
           role-to-assume: arn:aws:iam::${{ needs.collect.outputs.account }}:role/GitHubActionsRole
 
       - name: Start pipeline
         run: |
-          echo "⏳ Starting pipeline: ${{ matrix.pipeline }}..."
+          REGION=${{ github.event.inputs.region }}
+          echo "⏳ Starting pipeline: ${{ matrix.pipeline }} in region $REGION..."
           exec_id=$(aws codepipeline start-pipeline-execution \
             --name "${{ matrix.pipeline }}" \
+            --region "$REGION" \
             --pipeline-parameters \
               name=arg1,value=${{ github.event.inputs.arg1 }} \
               name=arg2,value=${{ github.event.inputs.arg2 }} \
