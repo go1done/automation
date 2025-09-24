@@ -1,0 +1,115 @@
+name: Poll AWS CodePipelines from Matrix
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  trigger-pipelines:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pipeline-name: ["my-pipeline-A", "my-pipeline-B", "my-pipeline-C"]
+    
+    # Define outputs to be collected by a subsequent job
+    outputs:
+      execution-id: ${{ steps.trigger.outputs.execution-id }}
+      pipeline-name: ${{ matrix.pipeline-name }}
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Trigger AWS CodePipeline Execution
+        id: trigger
+        run: |
+          # The aws codepipeline start-pipeline-execution command triggers a pipeline.
+          # We use jq to parse the ExecutionId from the JSON output.
+          # The output is then set as a step output.
+          EXECUTION_ID=$(aws codepipeline start-pipeline-execution --name ${{ matrix.pipeline-name }} | jq -r '.pipelineExecutionId')
+          echo "Triggered pipeline '${{ matrix.pipeline-name }}' with execution ID: $EXECUTION_ID"
+          echo "execution-id=$EXECUTION_ID" >> $GITHUB_OUTPUT
+
+  poll-pipeline-status:
+    runs-on: ubuntu-latest
+    needs: trigger-pipelines
+    env:
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    
+    steps:
+      - name: Collect all pipeline execution IDs
+        id: collect-ids
+        run: |
+          # This script collects the execution IDs and pipeline names from the matrix jobs.
+          # The `fromJSON` function is not supported for matrix outputs across jobs. 
+          # Instead, you must parse the data from the `needs` context, which contains the output.
+          # This is a common workaround to get all outputs from a matrix.
+          PIPELINE_INFO=$(jq -n \
+            --argjson matrix_outputs '${{ toJSON(needs.trigger-pipelines.outputs) }}' \
+            '[
+              $matrix_outputs | to_entries[] | .value | { 
+                pipelineName: .pipeline-name, 
+                executionId: .execution-id 
+              }
+            ]'
+          )
+          
+          echo "Collected Pipeline Information: $PIPELINE_INFO"
+          echo "PIPELINE_INFO=$PIPELINE_INFO" >> $GITHUB_ENV
+          
+      - name: Wait for all pipelines to complete
+        run: |
+          # Load the pipeline information from the environment variable
+          PIPELINE_INFO=$(echo "${{ env.PIPELINE_INFO }}" | jq -c '.[]')
+          
+          POLLING_STATUS="RUNNING"
+          while [ "$POLLING_STATUS" != "SUCCESSFUL" ]; do
+            ALL_COMPLETE=true
+            echo "--- Checking pipeline statuses ---"
+            
+            for pipeline_json in $PIPELINE_INFO; do
+              PIPELINE_NAME=$(echo $pipeline_json | jq -r '.pipelineName')
+              EXECUTION_ID=$(echo $pipeline_json | jq -r '.executionId')
+              
+              # AWS CLI command to get the execution state
+              STATUS=$(aws codepipeline get-pipeline-execution \
+                --pipeline-name "$PIPELINE_NAME" \
+                --pipeline-execution-id "$EXECUTION_ID" \
+                | jq -r '.pipelineExecution.status')
+                
+              echo "Pipeline '$PIPELINE_NAME' ($EXECUTION_ID) status: $STATUS"
+              
+              # Check if the status indicates completion
+              case "$STATUS" in
+                Succeeded)
+                  echo "✅ Pipeline '$PIPELINE_NAME' finished successfully."
+                  ;;
+                Failed|Stopped|Cancelled|Abandoned)
+                  echo "❌ Pipeline '$PIPELINE_NAME' failed with status: $STATUS."
+                  exit 1
+                  ;;
+                *)
+                  # If any pipeline is not yet complete, set the flag to false
+                  ALL_COMPLETE=false
+                  echo "⏳ Pipeline '$PIPELINE_NAME' is still in progress."
+                  ;;
+              esac
+            done
+            
+            if [ "$ALL_COMPLETE" = "true" ]; then
+              echo "All pipelines have completed. Exiting poll loop."
+              POLLING_STATUS="SUCCESSFUL"
+            else
+              echo "Some pipelines are still in progress. Waiting for 30 seconds..."
+              sleep 30
+            fi
+          done
