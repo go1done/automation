@@ -37,79 +37,81 @@ jobs:
           echo "Triggered pipeline '${{ matrix.pipeline-name }}' with execution ID: $EXECUTION_ID"
           echo "execution-id=$EXECUTION_ID" >> $GITHUB_OUTPUT
 
-  poll-pipeline-status:
+poll_and_summarize:
     runs-on: ubuntu-latest
-    needs: trigger-pipelines
+    needs: [trigger_deploy] # Wait for all matrix jobs to complete
     env:
       AWS_REGION: us-east-1
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      # Create a consolidated list of the job outputs from the matrix job
+      # This is the key to gathering all parallel results
+      ALL_EXECUTIONS: ${{ needs.trigger_deploy.outputs.trigger_pipeline }}
     
     steps:
-      - name: Collect all pipeline execution IDs
-        id: collect-ids
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Poll Pipelines and Generate Summary
+        id: poll
         run: |
-          # This script collects the execution IDs and pipeline names from the matrix jobs.
-          # The `fromJSON` function is not supported for matrix outputs across jobs. 
-          # Instead, you must parse the data from the `needs` context, which contains the output.
-          # This is a common workaround to get all outputs from a matrix.
-          PIPELINE_INFO=$(jq -n \
-            --argjson matrix_outputs '${{ toJSON(needs.trigger-pipelines.outputs) }}' \
-            '[
-              $matrix_outputs | to_entries[] | .value | { 
-                pipelineName: .pipeline-name, 
-                executionId: .execution-id 
-              }
-            ]'
-          )
+          MAX_POLLS=60      # Maximum number of checks (e.g., 60 * 10s = 10 minutes max wait)
+          POLL_INTERVAL=10  # Wait time between polls in seconds
           
-          echo "Collected Pipeline Information: $PIPELINE_INFO"
-          echo "PIPELINE_INFO=$PIPELINE_INFO" >> $GITHUB_ENV
+          # Initialize the summary table
+          SUMMARY_TABLE="| Pipeline | Status | Link |\n| :--- | :--- | :--- |\n"
           
-      - name: Wait for all pipelines to complete
-        run: |
-          # Load the pipeline information from the environment variable
-          PIPELINE_INFO=$(echo "${{ env.PIPELINE_INFO }}" | jq -c '.[]')
-          
-          POLLING_STATUS="RUNNING"
-          while [ "$POLLING_STATUS" != "SUCCESSFUL" ]; do
-            ALL_COMPLETE=true
-            echo "--- Checking pipeline statuses ---"
-            
-            for pipeline_json in $PIPELINE_INFO; do
-              PIPELINE_NAME=$(echo $pipeline_json | jq -r '.pipelineName')
-              EXECUTION_ID=$(echo $pipeline_json | jq -r '.executionId')
+          # 1. Loop through all pipelines started in the matrix job
+          for item in $(echo "$ALL_EXECUTIONS" | jq -r 'to_entries[] | .key'); do
+              PIPELINE_NAME=$(jq -r '.[env].PIPELINE_NAME' --arg env "$item" <<< "$ALL_EXECUTIONS")
+              EXECUTION_ID=$(jq -r '.[env].EXECUTION_ID' --arg env "$item" <<< "$ALL_EXECUTIONS")
               
-              # AWS CLI command to get the execution state
-              STATUS=$(aws codepipeline get-pipeline-execution \
-                --pipeline-name "$PIPELINE_NAME" \
-                --pipeline-execution-id "$EXECUTION_ID" \
-                | jq -r '.pipelineExecution.status')
-                
-              echo "Pipeline '$PIPELINE_NAME' ($EXECUTION_ID) status: $STATUS"
+              STATUS="IN PROGRESS"
+              POLL_COUNT=0
               
-              # Check if the status indicates completion
-              case "$STATUS" in
-                Succeeded)
-                  echo "✅ Pipeline '$PIPELINE_NAME' finished successfully."
-                  ;;
-                Failed|Stopped|Cancelled|Abandoned)
-                  echo "❌ Pipeline '$PIPELINE_NAME' failed with status: $STATUS."
-                  exit 1
-                  ;;
-                *)
-                  # If any pipeline is not yet complete, set the flag to false
-                  ALL_COMPLETE=false
-                  echo "⏳ Pipeline '$PIPELINE_NAME' is still in progress."
-                  ;;
-              esac
-            done
-            
-            if [ "$ALL_COMPLETE" = "true" ]; then
-              echo "All pipelines have completed. Exiting poll loop."
-              POLLING_STATUS="SUCCESSFUL"
-            else
-              echo "Some pipelines are still in progress. Waiting for 30 seconds..."
-              sleep 30
-            fi
+              # 2. Polling Loop
+              echo "::group::Polling CodePipeline: $PIPELINE_NAME (ID: $EXECUTION_ID)"
+              while [ "$STATUS" == "InProgress" ] && [ $POLL_COUNT -lt $MAX_POLLS ]; do
+                  sleep $POLL_INTERVAL
+                  POLL_COUNT=$((POLL_COUNT + 1))
+                  
+                  # Query CodePipeline for the status of the specific execution ID
+                  RESULT=$(aws codepipeline get-pipeline-execution \
+                    --pipeline-name $PIPELINE_NAME \
+                    --pipeline-execution-id $EXECUTION_ID \
+                    --query 'pipelineExecution.status' --output text)
+                  
+                  STATUS=$RESULT
+                  echo "  Poll $POLL_COUNT: Status is $STATUS"
+              done
+              echo "::endgroup::"
+              
+              # 3. Final Status and Summary Generation
+              PIPELINE_URL="https://${AWS_REGION}.console.aws.amazon.com/codesuite/codepipeline/pipelines/$PIPELINE_NAME/view?region=${AWS_REGION}"
+              
+              if [ "$STATUS" == "Succeeded" ]; then
+                  STATUS_ICON="✅ Succeeded"
+                  SUMMARY_TABLE+="| **$PIPELINE_NAME** | **$STATUS_ICON** | [View]($PIPELINE_URL) |\n"
+              elif [ "$STATUS" == "Failed" ]; then
+                  STATUS_ICON="❌ Failed"
+                  SUMMARY_TABLE+="| **$PIPELINE_NAME** | **$STATUS_ICON** | [View]($PIPELINE_URL) |\n"
+                  # Set a failure flag for the entire workflow if any pipeline failed
+                  echo "::error::Pipeline $PIPELINE_NAME failed."
+                  FAIL_FLAG=true
+              else
+                  STATUS_ICON="🟡 Timed Out"
+                  SUMMARY_TABLE+="| **$PIPELINE_NAME** | **$STATUS_ICON** | [View]($PIPELINE_URL) |\n"
+                  echo "::error::Pipeline $PIPELINE_NAME timed out after $MAX_POLLS polls."
+                  FAIL_FLAG=true
+              fi
           done
+
+          # 4. Output the Final Summary
+          echo "$SUMMARY_TABLE" >> $GITHUB_STEP_SUMMARY
+
+          # 5. Fail the job if any pipeline failed or timed out
+          if [ "$FAIL_FLAG" = true ]; then
+              exit 1
+          fi
