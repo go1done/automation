@@ -1,117 +1,217 @@
-name: Poll AWS CodePipelines from Matrix
+name: Parallel CodePipeline Execution (Self-Contained)
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
+    inputs:
+      pipeline_list:
+        description: 'Comma-separated list of CodePipeline names to execute (e.g., pipe-A,pipe-B,pipe-C)'
+        required: true
+        default: 'pipe-A,pipe-B,pipe-C'
 
 jobs:
-  trigger-pipelines:
+  # ----------------------------------------------
+  # 1. SETUP: Dynamically converts the input list into a JSON matrix
+  # ----------------------------------------------
+  setup:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        pipeline-name: ["my-pipeline-A", "my-pipeline-B", "my-pipeline-C"]
-    
-    # Define outputs to be collected by a subsequent job
     outputs:
-      execution-id: ${{ steps.trigger.outputs.execution-id }}
-      pipeline-name: ${{ matrix.pipeline-name }}
-
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
-
-      - name: Trigger AWS CodePipeline Execution
-        id: trigger
+      - id: set-matrix
+        name: Prepare Matrix
         run: |
-          # The aws codepipeline start-pipeline-execution command triggers a pipeline.
-          # We use jq to parse the ExecutionId from the JSON output.
-          # The output is then set as a step output.
-          EXECUTION_ID=$(aws codepipeline start-pipeline-execution --name ${{ matrix.pipeline-name }} | jq -r '.pipelineExecutionId')
-          echo "Triggered pipeline '${{ matrix.pipeline-name }}' with execution ID: $EXECUTION_ID"
-          echo "execution-id=$EXECUTION_ID" >> $GITHUB_OUTPUT
+          # Create a JSON array from the comma-separated input list for the matrix job
+          PIPELINES='["'$(echo ${{ github.event.inputs.pipeline_list }} | tr -d ' ' | tr ',' '","')'"]'
+          echo "matrix=$PIPELINES" >> $GITHUB_OUTPUT
 
-poll_and_summarize:
+  # ----------------------------------------------
+  # 2. TRIGGER: Matrix job to simultaneously start all pipelines
+  # ----------------------------------------------
+  trigger-pipelines:
+    needs: setup
     runs-on: ubuntu-latest
-    needs: [trigger_deploy] # Wait for all matrix jobs to complete
-    env:
-      AWS_REGION: us-east-1
-      # Create a consolidated list of the job outputs from the matrix job
-      # This is the key to gathering all parallel results
-      ALL_EXECUTIONS: ${{ needs.trigger_deploy.outputs.trigger_pipeline }}
-    
+    # Set this to true to fail the entire workflow quickly if the first pipeline fails to start
+    # Set to false if you want ALL triggers to be attempted before failing
+    fail-fast: false
+    strategy:
+      matrix:
+        pipeline_name: ${{ fromJson(needs.setup.outputs.matrix) }}
+
     steps:
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          
+      - name: Install JQ for JSON parsing
+        run: sudo apt-get install -y jq
 
-      - name: Poll Pipelines and Generate Summary
-        id: poll
+      - name: Start Execution and Save ID
+        id: start
         run: |
-          MAX_POLLS=60      # Maximum number of checks (e.g., 60 * 10s = 10 minutes max wait)
-          POLL_INTERVAL=10  # Wait time between polls in seconds
+          PIPELINE_NAME="${{ matrix.pipeline_name }}"
+          AWS_REGION="${{ secrets.AWS_REGION }}"
+          EXECUTION_ID="TRIGGER_FAILED" # Default to failed
           
-          # Initialize the summary table
-          SUMMARY_TABLE="| Pipeline | Status | Link |\n| :--- | :--- | :--- |\n"
+          echo "Attempting to start: $PIPELINE_NAME"
           
-          # 1. Loop through all pipelines started in the matrix job
-          for item in $(echo "$ALL_EXECUTIONS" | jq -r 'to_entries[] | .key'); do
-              PIPELINE_NAME=$(jq -r '.[env].PIPELINE_NAME' --arg env "$item" <<< "$ALL_EXECUTIONS")
-              EXECUTION_ID=$(jq -r '.[env].EXECUTION_ID' --arg env "$item" <<< "$ALL_EXECUTIONS")
-              
-              STATUS="IN PROGRESS"
+          # Attempt to start the pipeline and capture the execution ID
+          RESULT=$(aws codepipeline start-pipeline-execution \
+            --name "$PIPELINE_NAME" \
+            --query 'pipelineExecutionId' \
+            --output text 2>&1)
+          
+          # Check for successful start (a non-empty, non-error ID)
+          if echo "$RESULT" | grep -q '^[0-9a-f-]\{36\}$'; then
+              EXECUTION_ID="$RESULT"
+              echo "Started Execution ID: $EXECUTION_ID"
+          else
+              echo "::warning::Failed to start pipeline $PIPELINE_NAME. Output: $RESULT"
+              # Keep EXECUTION_ID as TRIGGER_FAILED
+          fi
+          
+          # Construct the execution metadata string: name|id|url
+          URL="https://$AWS_REGION.console.aws.amazon.com/codesuite/codepipeline/pipelines/$PIPELINE_NAME/view?region=$AWS_REGION#/view/execution/$EXECUTION_ID"
+          METADATA="$PIPELINE_NAME|$EXECUTION_ID|$URL"
+          
+          # Set the output. This output will be collected in the next job.
+          echo "execution_metadata=$METADATA" >> $GITHUB_OUTPUT
+
+  # ----------------------------------------------
+  # 3. MONITOR: Collect execution details and summarize statuses
+  # ----------------------------------------------
+  monitor-pipelines:
+    needs: trigger-pipelines
+    runs-on: ubuntu-latest
+    
+    # Map the outputs of the matrix job into a single list
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      EXECUTION_METADATA: ${{ toJson(needs.trigger-pipelines.outputs) }}
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          
+      - name: Install JQ for JSON parsing
+        run: sudo apt-get install -y jq
+        
+      - name: Poll and Summarize All Executions
+        id: monitor
+        run: |
+          # --- Environment/Setup ---
+          
+          # Initialize summary table and overall status flag
+          SUMMARY_TABLE="### CodePipeline Execution Summary 📋\n"
+          SUMMARY_TABLE+="| Pipeline | Execution ID | Status | Link |\n"
+          SUMMARY_TABLE+="|---|---|---|---|\n"
+          OVERALL_STATUS="Succeeded"
+          
+          # Use JQ to extract the execution_metadata from all matrix runs
+          # The execution metadata is 'pipe-A|id-123|url'
+          IFS=$'\n' PIPELINES=($(echo "$EXECUTION_METADATA" | jq -r '
+            .trigger-pipelines
+            | .[]
+            | .outputs
+            | .execution_metadata
+          '))
+          
+          echo "Found ${#PIPELINES[@]} pipeline execution(s) to monitor."
+          
+          # --- Polling Logic (monitor.sh equivalent) ---
+          
+          POLL_PIDS=()
+          
+          # Start background polling for each pipeline
+          for META in "${PIPELINES[@]}"; do
+            (
+              IFS='|' read -r NAME ID URL <<< "$META"
+              STATUS="InProgress"
+              MAX_POLLS=120 # 60 minutes total (120 * 30s poll)
               POLL_COUNT=0
               
-              # 2. Polling Loop
-              echo "::group::Polling CodePipeline: $PIPELINE_NAME (ID: $EXECUTION_ID)"
-              while [ "$STATUS" == "InProgress" ] && [ $POLL_COUNT -lt $MAX_POLLS ]; do
-                  sleep $POLL_INTERVAL
-                  POLL_COUNT=$((POLL_COUNT + 1))
+              LINE_OUTPUT=""
+
+              if [ "$ID" == "TRIGGER_FAILED" ]; then
+                  STATUS="TriggerFailed"
+              else
+                  while [ "$STATUS" == "InProgress" ] && [ $POLL_COUNT -lt $MAX_POLLS ]; do
+                      STATUS=$(aws codepipeline get-pipeline-execution \
+                          --pipeline-name "$NAME" \
+                          --pipeline-execution-id "$ID" \
+                          --query 'pipelineExecution.status' \
+                          --output text 2>/dev/null)
+                      
+                      if [ $? -ne 0 ] || [ -z "$STATUS" ]; then
+                          STATUS="PollFailed"
+                          break
+                      fi
+
+                      if [ "$STATUS" == "InProgress" ]; then
+                          sleep 30
+                          POLL_COUNT=$((POLL_COUNT + 1))
+                      fi
+                  done
                   
-                  # Query CodePipeline for the status of the specific execution ID
-                  RESULT=$(aws codepipeline get-pipeline-execution \
-                    --pipeline-name $PIPELINE_NAME \
-                    --pipeline-execution-id $EXECUTION_ID \
-                    --query 'pipelineExecution.status' --output text)
-                  
-                  STATUS=$RESULT
-                  echo "  Poll $POLL_COUNT: Status is $STATUS"
-              done
-              echo "::endgroup::"
+                  if [ $POLL_COUNT -eq $MAX_POLLS ] && [ "$STATUS" == "InProgress" ]; then
+                      STATUS="Timeout"
+                  fi
+              fi
               
-              # 3. Final Status and Summary Generation
-              PIPELINE_URL="https://${AWS_REGION}.console.aws.amazon.com/codesuite/codepipeline/pipelines/$PIPELINE_NAME/view?region=${AWS_REGION}"
+              # Format line for final summary
+              EMOJI="❓"
+              FINAL_STATUS=""
               
               if [ "$STATUS" == "Succeeded" ]; then
-                  STATUS_ICON="✅ Succeeded"
-                  SUMMARY_TABLE+="| **$PIPELINE_NAME** | **$STATUS_ICON** | [View]($PIPELINE_URL) |\n"
-              elif [ "$STATUS" == "Failed" ]; then
-                  STATUS_ICON="❌ Failed"
-                  SUMMARY_TABLE+="| **$PIPELINE_NAME** | **$STATUS_ICON** | [View]($PIPELINE_URL) |\n"
-                  # Set a failure flag for the entire workflow if any pipeline failed
-                  echo "::error::Pipeline $PIPELINE_NAME failed."
-                  FAIL_FLAG=true
+                  EMOJI="✅"
+                  FINAL_STATUS="Succeeded"
+              elif [[ "$STATUS" == "Failed" || "$STATUS" == "TriggerFailed" || "$STATUS" == "Timeout" || "$STATUS" == "PollFailed" ]]; then
+                  EMOJI="❌"
+                  FINAL_STATUS="Failed"
+                  # Since this is a background job, write the failure status to a temporary file
+                  echo "Failure" > /tmp/${NAME}_status
+              elif [[ "$STATUS" == "Stopped" || "$STATUS" == "Superseded" ]]; then
+                  EMOJI="⚠️"
+                  FINAL_STATUS="Warning"
               else
-                  STATUS_ICON="🟡 Timed Out"
-                  SUMMARY_TABLE+="| **$PIPELINE_NAME** | **$STATUS_ICON** | [View]($PIPELINE_URL) |\n"
-                  echo "::error::Pipeline $PIPELINE_NAME timed out after $MAX_POLLS polls."
-                  FAIL_FLAG=true
+                  FINAL_STATUS="$STATUS"
               fi
+              
+              # Print result line to a temporary file for collection later
+              LINE_OUTPUT="| $NAME | \`$ID\` | $EMOJI **$FINAL_STATUS** | [Link]($URL) |"
+              echo "$LINE_OUTPUT" > /tmp/${NAME}_line
+            ) & # End of background job
+            POLL_PIDS+=($!)
           done
-
-          # 4. Output the Final Summary
-          echo "$SUMMARY_TABLE" >> $GITHUB_STEP_SUMMARY
-
-          # 5. Fail the job if any pipeline failed or timed out
-          if [ "$FAIL_FLAG" = true ]; then
+          
+          # Wait for all background polling jobs to finish
+          wait "${POLL_PIDS[@]}"
+          
+          # --- Final Summary Aggregation ---
+          
+          # Append all individual line files to the summary table
+          find /tmp -name '*_line' -print0 | sort -z | xargs -0 cat >> temp_summary.md
+          SUMMARY_TABLE+=$(cat temp_summary.md)
+          
+          # Check for any failure flags written by the background jobs
+          if find /tmp -name '*_status' | grep -q 'Failure'; then
+              OVERALL_STATUS="Failed"
+          fi
+          
+          # Output the final summary to the GitHub Actions Summary page
+          echo -e "$SUMMARY_TABLE" >> $GITHUB_STEP_SUMMARY
+          
+          # Exit based on overall status
+          if [ "$OVERALL_STATUS" == "Failed" ]; then
+              echo "::error::One or more pipelines failed or could not be triggered. Review the summary above."
               exit 1
+          else
+              echo "All monitored pipelines completed successfully."
+              exit 0
           fi
