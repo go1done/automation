@@ -1,0 +1,128 @@
+name: 1. Production Deployment (Re-run Enabled)
+
+on:
+  # 1. Allows manual triggering from the GitHub Actions UI
+  workflow_dispatch:
+    inputs:
+      deployment_type:
+        description: 'Choose the deployment target'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - api
+          - web-app
+          - database-migrations
+
+# Define who is authorized to start this deployment
+env:
+  ALLOWED_USERS_VAR_NAME: ALLOWED_DEPLOY_USERS
+
+jobs:
+  # -----------------------------------------------------------
+  # 1. AUTHENTICATION & RE-RUN GATE 🔐
+  # This job checks authorization for BOTH initial run and re-run.
+  # It strictly enforces that only the ORIGINAL authorized user can re-run.
+  # -----------------------------------------------------------
+  authorize:
+    runs-on: ubuntu-latest
+    outputs:
+      authorized: ${{ steps.auth-check.outputs.authorized }}
+      target: ${{ github.event.inputs.deployment_type }}
+      
+    steps:
+      - name: Load Allowed Users
+        id: load_vars
+        run: |
+          ALLOWED_USERS="${{ vars[env.ALLOWED_USERS_VAR_NAME] }}"
+          echo "ALLOWED_USERS=$ALLOWED_USERS" >> $GITHUB_ENV
+        
+      - name: Check User Authorization (Initial Run or Re-run)
+        id: auth-check
+        env:
+          # Use github.triggering_actor if available (re-run), otherwise use github.actor (initial run)
+          CURRENT_ACTOR: ${{ github.triggering_actor || github.actor }}
+          ORIGINAL_ACTOR: ${{ github.actor }}
+        run: |
+          ACTOR_TO_CHECK="$CURRENT_ACTOR"
+          ALLOWED_LIST="${{ env.ALLOWED_USERS }}"
+          
+          echo "Original Initiator: $ORIGINAL_ACTOR"
+          echo "Current Actor (Clicking Re-run): $CURRENT_ACTOR"
+
+          # --- STRICT POLICY CHECK ---
+          
+          # 1. Check if the current actor is the original actor (for re-runs)
+          if [[ "$CURRENT_ACTOR" != "$ORIGINAL_ACTOR" ]]; then
+            echo "::error title=Re-run Policy Violation::Re-run rejected. Only the original initiator ($ORIGINAL_ACTOR) may re-run this workflow."
+            echo "authorized=false" >> $GITHUB_OUTPUT
+            exit 1 # Fail: Different user attempted re-run
+          fi
+
+          # 2. Check if the current actor is in the allowed list
+          if echo "$ALLOWED_LIST" | grep -q "$ACTOR_TO_CHECK"; then
+            echo "::notice title=Authorization::User $ACTOR_TO_CHECK is authorized."
+            echo "authorized=true" >> $GITHUB_OUTPUT
+          else
+            echo "::error title=Authorization::User $ACTOR_TO_CHECK is NOT authorized to run this deployment."
+            echo "authorized=false" >> $GITHUB_OUTPUT
+            exit 1 # Fail: Not an authorized user
+          fi
+
+
+  # -----------------------------------------------------------
+  # 2. DEPLOYMENT JOB (MATRIX) 🚀
+  # This job runs the deployment logic for each target.
+  # -----------------------------------------------------------
+  deploy-target:
+    needs: authorize
+    # Only run if the authorization job passed
+    if: needs.authorize.outputs.authorized == 'true'
+    
+    # Configure the environment to enforce approval rules (WARNING: Approval is bypassed on re-run!)
+    environment: 
+      name: production
+      url: https://example.com/deployment/${{ matrix.target }} 
+      
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Generate the matrix dynamically based on the input
+        target: 
+          - ${{ needs.authorize.outputs.target == 'all' && 'api' || needs.authorize.outputs.target }}
+          - ${{ needs.authorize.outputs.target == 'all' && 'web-app' || '' }}
+          - ${{ needs.authorize.outputs.target == 'all' && 'database-migrations' || '' }}
+          
+    continue-on-error: false
+    if: ${{ matrix.target != '' }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Deploy ${{ matrix.target }}
+        # Actual deployment logic here
+        run: |
+          echo "--- Starting Deployment for: ${{ matrix.target }} ---"
+          echo "Deployment initiated by: ${{ github.triggering_actor || github.actor }}"
+          sleep 5 
+          echo "Deployment of ${{ matrix.target }} complete."
+
+  # -----------------------------------------------------------
+  # 3. FORCE FAILURE TO ENABLE RE-RUN ⚠️ (Method 1)
+  # This job will always fail if the deployment job succeeded, 
+  # keeping the "Re-run failed jobs" button available.
+  # -----------------------------------------------------------
+  force-fail:
+    runs-on: ubuntu-latest
+    needs: deploy-target
+    
+    # Only run if the deployment job Succeeded
+    if: success()
+    
+    steps:
+      - name: Force Workflow Failure
+        run: |
+          echo "Deployment succeeded. Failing final step to enable re-run for authorized user."
+          exit 1
