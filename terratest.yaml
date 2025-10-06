@@ -1,0 +1,255 @@
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 4.0"
+    }
+  }
+  required_version = ">= 1.3"
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+# — S3 Bucket for pipeline artifacts
+resource "aws_s3_bucket" "pipeline_artifacts" {
+  bucket = var.pipeline_bucket_name
+  acl    = "private"
+
+  versioning {
+    enabled = true
+  }
+
+  server_side_encryption_configuration {
+    rule {
+      apply_server_side_encryption_by_default {
+        sse_algorithm = "AES256"
+      }
+    }
+  }
+
+  tags = var.tags
+}
+
+# — IAM Role for CodePipeline
+resource "aws_iam_role" "codepipeline_role" {
+  name = "${var.pipeline_name}-role"
+
+  assume_role_policy = data.aws_iam_policy_document.codepipeline_assume.json
+}
+
+data "aws_iam_policy_document" "codepipeline_assume" {
+  statement {
+    effect = "Allow"
+    principals {
+      type        = "Service"
+      identifiers = ["codepipeline.amazonaws.com"]
+    }
+    actions = ["sts:AssumeRole"]
+  }
+}
+
+# Attach policy to that role
+resource "aws_iam_role_policy" "codepipeline_policy" {
+  name = "${var.pipeline_name}-policy"
+  role = aws_iam_role.codepipeline_role.id
+
+  policy = data.aws_iam_policy_document.codepipeline_policy_doc.json
+}
+
+data "aws_iam_policy_document" "codepipeline_policy_doc" {
+  statement {
+    effect = "Allow"
+
+    actions = [
+      "s3:GetObject",
+      "s3:GetObjectVersion",
+      "s3:PutObject",
+      "s3:PutObjectAcl",
+      "s3:GetBucketVersioning",
+      "s3:ListBucket",
+    ]
+    resources = [
+      aws_s3_bucket.pipeline_artifacts.arn,
+      "${aws_s3_bucket.pipeline_artifacts.arn}/*",
+    ]
+  }
+
+  statement {
+    effect = "Allow"
+    actions = [
+      "codebuild:BatchGetBuilds",
+      "codebuild:StartBuild",
+      "codebuild:BatchGetProjects",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    effect = "Allow"
+    actions = [
+      "iam:PassRole"
+    ]
+    resources = [
+      aws_iam_role.codebuild_role.arn
+    ]
+  }
+
+  # If you're using GitHub via CodeStar connections, include that
+  statement {
+    effect = "Allow"
+    actions = ["codestar-connections:UseConnection"]
+    resources = [
+      var.codestar_connection_arn
+    ]
+  }
+}
+
+# — IAM Role for CodeBuild
+resource "aws_iam_role" "codebuild_role" {
+  name = "${var.pipeline_name}-codebuild-role"
+
+  assume_role_policy = data.aws_iam_policy_document.codebuild_assume.json
+}
+
+data "aws_iam_policy_document" "codebuild_assume" {
+  statement {
+    effect = "Allow"
+    principals {
+      type        = "Service"
+      identifiers = ["codebuild.amazonaws.com"]
+    }
+    actions = ["sts:AssumeRole"]
+  }
+}
+
+# Attach policy (you’ll likely need more permissions depending on what your tests create/destroy)
+resource "aws_iam_role_policy" "codebuild_policy" {
+  name = "${var.pipeline_name}-codebuild-policy"
+  role = aws_iam_role.codebuild_role.id
+
+  policy = data.aws_iam_policy_document.codebuild_policy_doc.json
+}
+
+data "aws_iam_policy_document" "codebuild_policy_doc" {
+  statement {
+    effect = "Allow"
+    actions = [
+      "s3:GetObject",
+      "s3:PutObject",
+      "s3:GetObjectVersion",
+    ]
+    resources = [
+      aws_s3_bucket.pipeline_artifacts.arn,
+      "${aws_s3_bucket.pipeline_artifacts.arn}/*"
+    ]
+  }
+
+  # Allow CloudWatch logs
+  statement {
+    effect = "Allow"
+    actions = [
+      "logs:CreateLogGroup",
+      "logs:CreateLogStream",
+      "logs:PutLogEvents"
+    ]
+    resources = ["*"]
+  }
+
+  # If your tests create aws resources, add these as needed:
+  # e.g. "ec2:*", "iam:*", etc.
+
+}
+
+# — CodeBuild Project
+resource "aws_codebuild_project" "terratest" {
+  name          = "${var.pipeline_name}-build"
+  service_role  = aws_iam_role.codebuild_role.arn
+  description   = "Project to run Terratest + report"
+
+  artifacts {
+    type = "S3"
+    location = aws_s3_bucket.pipeline_artifacts.bucket
+    path     = "build-output"
+    packaging = "ZIP"
+    # include buildspec artifacts (reports)
+    override_artifact_name = false
+  }
+
+  environment {
+    compute_type                = var.compute_type
+    image                       = var.build_image
+    type                        = "LINUX_CONTAINER"
+    environment_variable {
+      name  = "AWS_DEFAULT_REGION"
+      value = var.aws_region
+    }
+  }
+
+  source {
+    type            = "GITHUB"
+    location        = var.github_repo_clone_url
+    buildspec       = var.buildspec_path  # e.g. "buildspec.yml"
+    git_clone_depth = 1
+    report_build_status = true
+  }
+
+  logs_config {
+    cloudwatch_logs {
+      group_name = "/aws/codebuild/${var.pipeline_name}-build"
+      stream_name = "build-log"
+    }
+  }
+}
+
+# — The CodePipeline
+resource "aws_codepipeline" "terratest_pipeline" {
+  name     = var.pipeline_name
+  role_arn = aws_iam_role.codepipeline_role.arn
+
+  artifact_store {
+    location = aws_s3_bucket.pipeline_artifacts.bucket
+    type     = "S3"
+  }
+
+  stage {
+    name = "Source"
+
+    action {
+      name             = "GitHub_Source"
+      category         = "Source"
+      owner            = "ThirdParty"
+      provider         = "GitHub"
+      version          = "1"
+      output_artifacts = ["source_output"]
+
+      configuration = {
+        Owner             = var.github_owner
+        Repo              = var.github_repo
+        Branch            = var.github_branch
+        OAuthToken        = var.github_oauth_token
+        # If you use a CodeStar connection instead:
+        # ConnectionArn = var.codestar_connection_arn
+      }
+    }
+  }
+
+  stage {
+    name = "Build"
+
+    action {
+      name             = "Run_Terratest"
+      category         = "Build"
+      owner            = "AWS"
+      provider         = "CodeBuild"
+      input_artifacts  = ["source_output"]
+      output_artifacts = ["build_output"]
+      version          = "1"
+
+      configuration = {
+        ProjectName = aws_codebuild_project.terratest.name
+      }
+    }
+  }
+}
