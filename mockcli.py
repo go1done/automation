@@ -1,102 +1,92 @@
 import boto3
-import json
-import argparse
-import sys
+from botocore.config import Config
 
-# --- Boto3 Dispatch Functions ---
+# --- Proxy Configuration (Centralized) ---
+# NOTE: Replace with your actual proxy details and credentials
+PROXY_HOST = "your.proxy.server.com:8080"
+PROXY_USER = "DOMAIN\\user"
+PROXY_PASS = "secure_password"
+HTTPS_PROXY_URL = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}"
 
-def _describe_cloudwatch_log_policies(region_name):
-    """Boto3 wrapper for 'aws logs describe-resource-policies'."""
+PROXY_CONFIG = Config(
+    proxies={
+        'https': HTTPS_PROXY_URL
+    },
+    # Optional: Increase connection/read timeouts if on a slow or complex network
+    # connect_timeout=10, 
+    # read_timeout=60,
+)
+
+# --------------------------------------------------------------------------
+
+def execute_aws_command(service_name: str, method_name: str, **kwargs) -> dict:
+    """
+    Dynamically executes a Boto3 API call with a predefined proxy configuration.
+
+    Args:
+        service_name: The name of the AWS service (e.g., 's3', 'ec2', 'iam').
+        method_name: The Boto3 client method name (e.g., 'list_buckets', 
+                     'describe_regions'). NOTE: This is NOT the full CLI command.
+        **kwargs: Keyword arguments for the API method (e.g., Bucket='my-bucket').
+
+    Returns:
+        The dictionary response from the AWS API call.
+    """
     try:
-        logs_client = boto3.client('logs', region_name=region_name)
-        response = logs_client.describe_resource_policies()
+        # 1. Create a Boto3 client dynamically, applying the proxy configuration.
+        client = boto3.client(
+            service_name,
+            config=PROXY_CONFIG
+        )
         
-        # Clean up response metadata
-        if 'ResponseMetadata' in response:
-            del response['ResponseMetadata']
-            
-        return json.dumps(response, indent=4), 0 # Return output and exit code 0 for success
+        # 2. Get the specific method (API action) from the client object by name.
+        # This is the "flexible" part, avoiding explicit pre-defined calls.
+        api_method = getattr(client, method_name)
+        
+        # 3. Execute the method, passing any required parameters (**kwargs).
+        response = api_method(**kwargs)
+        
+        return response
 
     except Exception as e:
-        return f"Error executing describe-resource-policies: {e}", 1 # Return error and exit code 1
+        print(f"Error executing AWS command: {e}")
+        # Re-raise the exception or return a structured error, depending on your needs
+        raise
 
-# --- Main Shell Simulation Function ---
+# --------------------------------------------------------------------------
+# --- Examples of usage ---
 
-def runaws_command(command_line_input):
-    """
-    Parses a CLI-like command string and executes the corresponding boto3 function.
-    
-    Example input: 'aws logs describe-resource-policies --region us-east-1'
-    """
-    print(f"Executing: {command_line_input}")
-    
-    # 1. Tokenize the input string
-    tokens = command_line_input.split()
-    
-    if len(tokens) < 3 or tokens[0] != 'aws':
-        print("\nError: Command must start with 'aws <service> <action>'.")
-        return
+# Example 1: Equivalent to `aws s3 list-buckets`
+s3_response = execute_aws_command(
+    service_name='s3',
+    method_name='list_buckets'
+)
 
-    aws_service = tokens[1]
-    aws_action = tokens[2]
-    
-    # 2. Use argparse for general argument handling
-    parser = argparse.ArgumentParser(prog=f'{aws_service} {aws_action}', exit_on_error=False)
-    
-    # All AWS commands require a region, so we enforce it generally
-    parser.add_argument('--region', required=True, help='The AWS region to target.')
+print("--- S3 List Buckets (via Proxy) ---")
+for bucket in s3_response.get('Buckets', []):
+    print(f"Bucket Name: {bucket['Name']}, Creation Date: {bucket['CreationDate']}")
+print("-" * 30)
 
-    # Dispatcher dictionary: Maps (service, action) to the corresponding function
-    command_map = {
-        ('logs', 'describe-resource-policies'): _describe_cloudwatch_log_policies,
-        # Add more commands here as needed:
-        # ('ec2', 'describe-vpcs'): _describe_ec2_vpcs, 
-    }
+# Example 2: Equivalent to `aws ec2 describe-regions --all-regions`
+ec2_response = execute_aws_command(
+    service_name='ec2',
+    method_name='describe_regions',
+    AllRegions=True  # Boto3 uses PascalCase for API parameters
+)
 
-    try:
-        # Parse arguments, excluding 'aws', 'service', and 'action'
-        # The parser will handle --region and other potential arguments
-        args = parser.parse_args(tokens[3:]) 
-        
-        # 3. Dispatch the command
-        dispatcher_key = (aws_service, aws_action)
-        if dispatcher_key in command_map:
-            # Call the specific boto3 wrapper function
-            output, exit_code = command_map[dispatcher_key](args.region)
-            
-            print("\n--- Command Output ---")
-            print(output)
-            print("----------------------\n")
-            
-        else:
-            print(f"\nError: Command '{aws_service} {aws_action}' is not yet implemented.")
-            
-    except argparse.ArgumentError as e:
-        print(f"\nError parsing arguments: {e}")
-        print("Usage:")
-        parser.print_help(sys.stdout)
-    except SystemExit:
-        # Suppress SystemExit from argparse's print_help on failure
-        pass
-    except Exception as e:
-        print(f"\nAn unexpected error occurred: {e}")
+print("--- EC2 Describe Regions (via Proxy) ---")
+for region in ec2_response.get('Regions', [])[:3]:
+    print(f"Region Name: {region['RegionName']}")
+print("-" * 30)
 
+# Example 3: Equivalent to `aws iam list-users --max-items 2`
+iam_response = execute_aws_command(
+    service_name='iam',
+    method_name='list_users',
+    MaxItems=2
+)
 
-# --- Example Usage ---
-if __name__ == "__main__":
-    
-    # Example 1: The target command (Success)
-    command_a = "aws logs describe-resource-policies --region us-east-1"
-    runaws_command(command_a)
-    
-    # -------------------------------------------------------------
-    
-    # Example 2: Missing required argument (Error handling demo)
-    command_b = "aws logs describe-resource-policies"
-    runaws_command(command_b)
-
-    # -------------------------------------------------------------
-
-    # Example 3: Unimplemented command (Scalability demo)
-    command_c = "aws ec2 describe-vpcs --region us-west-2"
-    runaws_command(command_c)
+print("--- IAM List Users (via Proxy) ---")
+for user in iam_response.get('Users', []):
+    print(f"User Name: {user['UserName']}, ARN: {user['Arn']}")
+print("-" * 30)
