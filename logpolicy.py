@@ -11,20 +11,44 @@ backup_file = f"log_policies_backup_{region}_{timestamp}.json"
 
 
 def backup_policies():
-    """Back up all log resource policies to a timestamped file."""
+    """Back up all log resource policies to a timestamped file, with readable timestamps and prettified JSON."""
     response = logs.describe_resource_policies()
-    policies = response.get("resourcePolicies", [])
+    raw_policies = response.get("resourcePolicies", [])
+    clean_policies = []
+
+    for policy in raw_policies:
+        # Convert lastUpdatedTime (milliseconds) to readable timestamp
+        ts_ms = policy.get("lastUpdatedTime")
+        readable_time = datetime.utcfromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d %H:%M:%S") if ts_ms else None
+
+        # Prettify policyDocument
+        raw_doc = policy.get("policyDocument", "")
+        try:
+            doc_json = json.loads(raw_doc)
+            pretty_doc = doc_json  # keep as dict for backup file
+        except Exception:
+            pretty_doc = raw_doc  # fallback to raw string if invalid
+
+        clean_policies.append({
+            "policyName": policy.get("policyName"),
+            "lastUpdatedTime": readable_time,
+            "policyDocument": pretty_doc
+        })
 
     with open(backup_file, "w") as f:
-        json.dump(policies, f, indent=2)
+        json.dump(clean_policies, f, indent=2)
 
     print(f"✅ Backup saved to: {backup_file}")
-    return policies
+    return clean_policies
 
 
-def hash_policy(policy_doc: str) -> str:
-    """Create a SHA1 hash of the policy document."""
-    return hashlib.sha1(policy_doc.encode("utf-8")).hexdigest()
+def hash_policy(policy_doc) -> str:
+    """Create a SHA1 hash of the policy document (accepts dict or string)."""
+    if isinstance(policy_doc, dict):
+        doc_str = json.dumps(policy_doc, sort_keys=True)
+    else:
+        doc_str = policy_doc
+    return hashlib.sha1(doc_str.encode("utf-8")).hexdigest()
 
 
 def detect_duplicates(policies):
@@ -43,7 +67,7 @@ def detect_duplicates(policies):
             hash_map[h] = policy
 
     if duplicates:
-        print("🔁 Duplicate policies detected (same document):")
+        print("\n🔁 Duplicate policies detected (same document):")
         for dup, orig in duplicates:
             print(f"  - {dup} is a duplicate of {orig}")
     else:
@@ -66,7 +90,7 @@ def delete_policies(policy_names):
 
 
 def restore_policies_from_file(file_path):
-    """Restore policies from a previously backed up JSON file."""
+    """Restore policies from a previously backed-up JSON file."""
     if not os.path.exists(file_path):
         print(f"❌ Backup file not found: {file_path}")
         return
@@ -75,11 +99,18 @@ def restore_policies_from_file(file_path):
         policies = json.load(f)
 
     for policy in policies:
-        name = policy["policyName"]
-        doc = policy["policyDocument"]
+        name = policy.get("policyName")
+        doc = policy.get("policyDocument")
+
+        # Convert dict back to string for boto3
+        if isinstance(doc, dict):
+            doc_str = json.dumps(doc)
+        else:
+            doc_str = doc
+
         print(f"🔁 Restoring policy: {name}")
         try:
-            logs.put_resource_policy(policyName=name, policyDocument=doc)
+            logs.put_resource_policy(policyName=name, policyDocument=doc_str)
             print(f"✅ Restored: {name}")
         except Exception as e:
             print(f"❌ Error restoring {name}: {e}")
@@ -88,13 +119,11 @@ def restore_policies_from_file(file_path):
 def menu():
     print("\n🛠️ CloudWatch Log Resource Policy Manager (region: {})".format(region))
     print("1️⃣  Backup existing policies")
-    print("2️⃣  Detect duplicates")
+    print("2️⃣  Detect duplicate policy documents")
     print("3️⃣  Delete policies by name (interactive)")
-    print("4️⃣  Restore policies from backup")
+    print("4️⃣  Restore policies from backup file")
     print("5️⃣  Exit")
-
-    choice = input("Choose an option: ").strip()
-    return choice
+    return input("Choose an option: ").strip()
 
 
 if __name__ == "__main__":
