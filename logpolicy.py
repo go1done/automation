@@ -3,6 +3,8 @@ import hashlib
 import json
 import os
 from datetime import datetime
+from deepdiff import DeepDiff
+from collections import defaultdict
 
 logs = boto3.client("logs")
 region = logs.meta.region_name
@@ -51,27 +53,71 @@ def hash_policy(policy_doc) -> str:
     return hashlib.sha1(doc_str.encode("utf-8")).hexdigest()
 
 
+
+
+def normalize_statement(stmt):
+    """Normalize a single IAM statement block to compare logically."""
+    def sort_if_list(v):
+        if isinstance(v, list):
+            return sorted(v)
+        return v
+
+    keys = ['Effect', 'Action', 'Resource', 'Principal', 'Condition', 'Sid']
+    return {
+        k: sort_if_list(stmt.get(k)) for k in keys if k in stmt
+    }
+
+def normalize_policy(policy_doc):
+    """Normalize a policy document into a comparable structure."""
+    version = policy_doc.get("Version", "2012-10-17")
+    statements = policy_doc.get("Statement", [])
+
+    if isinstance(statements, dict):
+        statements = [statements]
+
+    normalized = [normalize_statement(stmt) for stmt in statements]
+    return {
+        "Version": version,
+        "Statement": sorted(normalized, key=lambda s: json.dumps(s, sort_keys=True))
+    }
+
 def detect_duplicates(policies):
-    """Detect policies with identical documents (by hash)."""
-    hash_map = {}
+    """Detect logically duplicate policy documents."""
+    seen = []
     duplicates = []
 
     for policy in policies:
         name = policy["policyName"]
         doc = policy["policyDocument"]
-        h = hash_policy(doc)
 
-        if h in hash_map:
-            duplicates.append((name, hash_map[h]["policyName"]))
-        else:
-            hash_map[h] = policy
+        # Validate and normalize document
+        if not isinstance(doc, dict):
+            try:
+                doc = json.loads(doc)
+            except Exception as e:
+                print(f"⚠️  Skipping malformed policy {name}: {e}")
+                continue
+
+        norm = normalize_policy(doc)
+
+        # Compare with previously seen
+        match_found = False
+        for existing in seen:
+            diff = DeepDiff(existing["normalized"], norm, ignore_order=True)
+            if not diff:
+                duplicates.append((name, existing["name"]))
+                match_found = True
+                break
+
+        if not match_found:
+            seen.append({"name": name, "normalized": norm})
 
     if duplicates:
-        print("\n🔁 Duplicate policies detected (same document):")
+        print("\n🔁 Logically duplicate policies found:")
         for dup, orig in duplicates:
-            print(f"  - {dup} is a duplicate of {orig}")
+            print(f"  - {dup} is a logical duplicate of {orig}")
     else:
-        print("✅ No duplicate policies found.")
+        print("✅ No logical duplicates found.")
 
     return duplicates
 
