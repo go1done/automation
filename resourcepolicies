@@ -1,0 +1,45 @@
+That's an excellent point! Manually collecting outputs from every module scales poorly and increases the chance of error.While Terraform doesn't have a built-in feature to automatically discover and merge policy snippets without explicitly referencing the modules, you can achieve a high degree of automation by structuring your modules and using Terraform's configuration language features to dynamically build the list of policy documents.The core idea is to have all relevant modules register their required policy statements into a centralized map or list that is then read by the root module.Here is an advanced, more automated approach using Terraform locals and file organization:Automated Policy Merging with Locals1. The Policy File StructureInstead of having each module output a policy JSON, have each module that requires a policy statement write its policy JSON to a dedicated, shared file location (like a central policy_inputs directory) in the root of your configuration. However, this is generally complicated and discouraged in Terraform.A much better way is to pass the policy document back up and use a map.2. Standardize Module Output (Semi-Automated)You still need to define the output in your child modules, but you make the root module's processing more dynamic.In each child module (module-a, module-b):Terraform# module-a/outputs.tf
+
+output "log_policy_statement" {
+  # This output key name is standardized across ALL modules
+  value = data.aws_iam_policy_document.module_statement.json
+}
+
+# module-a/main.tf
+# ... policy document definition ...
+3. Dynamically Collect and Merge in the Root Module (Automation)In the root configuration, you can use the for expression to iterate over the module outputs and automatically build the list of policy documents to merge. This drastically reduces the manual work in the root module.Terraform# root/main.tf
+
+# 1. Define all module calls in a map (Crucial step for automation)
+module "services" {
+  source = "./modules/services"
+  for_each = tomap({
+    "api"       = { setting_a = "..." },
+    "worker"    = { setting_b = "..." },
+    "processor" = { setting_c = "..." }
+  })
+  # Pass settings from the map to the module
+  setting_a = lookup(each.value, "setting_a", null)
+  # ... other variables
+}
+
+# 2. Dynamically collect all policy documents from the module outputs
+locals {
+  # The 'for' expression iterates over the map of module calls (module.services)
+  # and extracts the 'log_policy_statement' output from EACH instance.
+  # This eliminates the need to manually list 'module.services["api"].log_policy_statement', etc.
+  all_policy_jsons = [
+    for key, svc in module.services : svc.log_policy_statement
+  ]
+}
+
+# 3. Merge them into a single policy document
+data "aws_iam_policy_document" "merged_policy" {
+  source_policy_documents = local.all_policy_jsons
+}
+
+# 4. Apply the merged policy
+resource "aws_cloudwatch_log_resource_policy" "unified_policy" {
+  policy_name     = "UnifiedLogPolicy"
+  policy_document = data.aws_iam_policy_document.merged_policy.json
+}
+Summary of AutomationThe key to automating this is the for_each meta-argument on your module calls combined with a for expression in your locals block.FeatureRole in AutomationStandardized OutputEvery module must use the exact same output name (e.g., log_policy_statement).for_each on ModulesCalls multiple module instances and exposes them as a map (module.services).for Expression in localsIterates over the map of module instances and automatically extracts the standardized output from every single module, building the list for merging.This approach minimizes the change required in the root module when you add a new service/module—you only need to add the new entry to the initial module map, and the policy merging automatically includes it.
