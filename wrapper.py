@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 import boto3
-import subprocess
 import sys
+import json
+from botocore.exceptions import ClientError
 from requests_kerberos import HTTPKerberosAuth, REQUIRED
-
-# NOTE: You MUST install 'requests-kerberos' for this to work:
-# pip install boto3 requests-kerberos
+import argparse
 
 # --- Configuration ---
 # 1. SET YOUR PROXY HERE:
@@ -14,10 +13,10 @@ PROXY_HOST_PORT = "http://your.kerberos.proxy.server:8080" # <-- **CHANGE THIS**
 # Define the proxy settings dictionary expected by Boto3/requests
 PROXY_DEFINITIONS = {
     'http': PROXY_HOST_PORT,
-    'https': PROXY_HOST_PORT 
+    'https': PROXY_HOST_PORT
 }
 
-# --- Boto3/Kerberos Setup ---
+# --- Kerberos Proxy Patching ---
 
 class KerberosProxyHandler:
     """
@@ -29,89 +28,77 @@ class KerberosProxyHandler:
 
     def __call__(self, session, **kwargs):
         """Called when a new requests session is created by Boto3/Botocore."""
-        
-        # 1. Apply the proxy definitions to the session
         session.proxies = self._proxies
-        
-        # 2. Inject the Kerberos Auth handler for the PROXY
-        # This tells the session to use Kerberos authentication when talking to the proxy.
+        # Inject the Kerberos Auth handler for the PROXY
         session.auth = HTTPKerberosAuth(
             mutual_authentication=REQUIRED,
             force_preemptive=True
         )
-        
-        # Ensure proxies are correctly set again (redundancy for clarity)
-        session.proxies['http'] = PROXY_HOST_PORT
-        session.proxies['https'] = PROXY_HOST_PORT
-        
         return session
 
 def initialize_kerberos_proxy():
     """Sets up the global Boto3 session to use the Kerberos proxy."""
     try:
-        # Get the default Boto3 session
         boto3.setup_default_session()
         default_session = boto3.DEFAULT_SESSION
-
         # Register the custom handler to the 'http-session-created' event.
-        # This ensures the proxy is configured whenever Boto3 makes an HTTP call.
         default_session.events.register(
             'http-session-created',
             KerberosProxyHandler(PROXY_DEFINITIONS)
         )
-        print(f"✅ Kerberos proxy configuration applied to Boto3 session: {PROXY_HOST_PORT}")
+        # print(f"✅ Kerberos proxy configuration applied to Boto3.")
     except ImportError:
         print("❌ Error: The 'requests-kerberos' library is required.")
         print("Please run: pip install requests-kerberos")
         sys.exit(1)
     except Exception as e:
-        print(f"❌ Error during Boto3 setup: {e}")
+        print(f"❌ Error during proxy setup: {e}")
         sys.exit(1)
 
-# --- CLI Implementation ---
+# --- Dynamic AWS CLI to Boto3 Mapper ---
 
-def run_aws_cli_command(args):
+def normalize_cli_to_boto(cli_name):
+    """Converts 'list-buckets' to 'list_buckets' and similar argument names."""
+    return cli_name.replace('-', '_')
+
+def parse_cli_args_to_boto_dict(cli_args):
     """
-    Executes the 'aws' command using the system's binary, leveraging the 
-    patched Boto3 configuration in the Python environment.
+    Converts a flat list of CLI arguments into a Boto3 Python dictionary.
+    Handles --param value and infers some Boto3 PascalCase conversion.
+    
+    NOTE: This is a simplified parser and will fail on complex list/JSON inputs.
     """
-    if not args:
-        print(f"Usage: {sys.argv[0]} s3 ls")
-        sys.exit(1)
+    boto_params = {}
+    i = 0
+    while i < len(cli_args):
+        arg = cli_args[i]
+        
+        if arg.startswith('--'):
+            param_key_cli = arg[2:]
+            
+            # Simple PascalCase conversion: my-key -> MyKey
+            param_key_boto = ''.join(word.capitalize() for word in param_key_cli.split('-'))
+            
+            # Check for value (i.e., next argument doesn't start with '--')
+            if i + 1 < len(cli_args) and not cli_args[i+1].startswith('--'):
+                param_value = cli_args[i+1]
+                boto_params[param_key_boto] = param_value
+                i += 2
+            else:
+                # Assume boolean flag if no value (e.g., --dry-run)
+                boto_params[param_key_boto] = True 
+                i += 1
+        else:
+            i += 1
+            
+    # The 'Region' parameter is handled separately in the client initialization
+    boto_params.pop('Region', None)
+    return boto_params
 
-    # 1. Initialize Boto3 session (to inject the proxy logic)
-    initialize_kerberos_proxy()
-
-    # 2. Construct the full command array
-    full_command = ['aws'] + args
-    
-    print(f"-> Executing AWS CLI Command: {' '.join(full_command)}")
-    
-    # 3. Execute the command
-    try:
-        # subprocess.run executes the 'aws' binary. Since the binary 
-        # executes in the same Python environment, the Boto3 session 
-        # (used by AWS CLI) will pick up the Kerberos proxy config.
-        result = subprocess.run(
-            full_command,
-            check=True,
-            text=True,
-            capture_output=False, # Stream output directly to the console
-            env=None # Keep environment clean; Boto3 handles the config
-        )
-        # Exit with the AWS CLI's return code
-        sys.exit(result.returncode)
-
-    except subprocess.CalledProcessError as e:
-        # Command ran but returned a non-zero exit code (e.g., AWS auth error)
-        print(f"AWS CLI command failed with error code {e.returncode}.")
-        sys.exit(e.returncode)
-    except FileNotFoundError:
-        # The 'aws' binary itself wasn't found
-        print("\n❌ Error: The 'aws' command was not found.")
-        print("Please ensure the AWS CLI is installed and in your system's PATH.")
-        sys.exit(127)
-
-if __name__ == "__main__":
-    # Pass all arguments *after* the script name to the AWS CLI
-    run_aws_cli_command(sys.argv[1:])
+def cmd_boto_dynamic(cli_args):
+    """
+    Main function to parse CLI arguments, configure Kerberos, and execute the Boto3 API call.
+    """
+    if len(cli_args) < 2:
+        print("Usage: ./cmd <service> <command> [options...]")
+        print("Example
