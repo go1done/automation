@@ -1,0 +1,22 @@
+kaws() {
+    local BRIDGE_SCRIPT="/path/to/proxy_bridge.py"
+    local PORT=3128
+    
+    # 1. Start the bridge if not already running
+    if ! lsof -i:$PORT > /dev/null; then
+        echo "Starting Kerberos Auth Bridge..."
+        python3 "$BRIDGE_SCRIPT" &
+        sleep 2 # Wait for startup
+    fi
+
+    # 2. Set the environment to route through the bridge
+    # We use 127.0.0.1 so the CLI talks to our Python script
+    export HTTP_PROXY="http://127.0.0.1:$PORT"
+    export HTTPS_PROXY="http://127.0.0.1:$PORT"
+    
+    # IMPORTANT: Use your corporate CA bundle if they do SSL inspection
+    export AWS_CA_BUNDLE="/path/to/corporate-ca-bundle.pem"
+
+    # 3. Execute the AWS command
+    aws "$@"
+}
