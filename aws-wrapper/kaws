@@ -1,22 +1,24 @@
-kaws() {
-    local BRIDGE_SCRIPT="/path/to/proxy_bridge.py"
-    local PORT=3128
-    
-    # 1. Start the bridge if not already running
-    if ! lsof -i:$PORT > /dev/null; then
-        echo "Starting Kerberos Auth Bridge..."
-        python3 "$BRIDGE_SCRIPT" &
-        sleep 2 # Wait for startup
+# Function to start bridge and wrap commands
+krun() {
+    # 1. Start bridge if not running
+    if ! netstat -ano | grep 3128 | grep LISTENING > /dev/null; then
+        # Use pythonw to run in background without a console window
+        pythonw.exe //C/path/to/win_kbridge.py &
+        sleep 2
     fi
 
-    # 2. Set the environment to route through the bridge
-    # We use 127.0.0.1 so the CLI talks to our Python script
-    export HTTP_PROXY="http://127.0.0.1:$PORT"
-    export HTTPS_PROXY="http://127.0.0.1:$PORT"
+    # 2. Proxy environment
+    export HTTP_PROXY="http://127.0.0.1:3128"
+    export HTTPS_PROXY="http://127.0.0.1:3128"
     
-    # IMPORTANT: Use your corporate CA bundle if they do SSL inspection
-    export AWS_CA_BUNDLE="/path/to/corporate-ca-bundle.pem"
+    # 3. SSL Fix: Point to the Windows Cert Store export or Corporate .pem
+    # Terraform and AWS CLI need this if your proxy inspects SSL
+    export AWS_CA_BUNDLE="/c/Users/$(whoami)/Documents/corp-ca.pem"
+    export CURL_CA_BUNDLE="$AWS_CA_BUNDLE"
 
-    # 3. Execute the AWS command
-    aws "$@"
+    "$@"
 }
+
+# Alias for convenience
+alias kaws='krun aws'
+alias ktf='krun terraform'
