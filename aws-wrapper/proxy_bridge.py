@@ -65,7 +65,7 @@ def get_kerberos_token(proxy_host):
     return None
 
 def resolve_proxy(target_url):
-    """Robustly resolves proxy using WinHTTP (PAC, WPAD, or Static)."""
+    """Robustly resolves proxy and cleans the returned string."""
     if not target_url.startswith('http'):
         target_url = f"https://{target_url}"
     
@@ -77,45 +77,42 @@ def resolve_proxy(target_url):
         options = WINHTTP_AUTOPROXY_OPTIONS()
         options.fAutoLogonIfChallenged = True
         
-        # Determine PAC vs WPAD
         if ie_config.lpszAutoConfigUrl:
-            options.dwFlags = 0x2 # WINHTTP_AUTOPROXY_CONFIG_URL
+            options.dwFlags = 0x2 
             options.lpszAutoConfigUrl = ie_config.lpszAutoConfigUrl
         elif ie_config.fAutoDetect:
-            options.dwFlags = 0x1 # WINHTTP_AUTOPROXY_AUTO_DETECT
-            options.dwAutoDetectFlags = 0x3 # DHCP & DNS
+            options.dwFlags = 0x1 
+            options.dwAutoDetectFlags = 0x3 
         else:
-            # Fallback to static proxy if defined
-            return ie_config.lpszProxy.split(';')[0] if ie_config.lpszProxy else "DIRECT"
+            return ie_config.lpszProxy if ie_config.lpszProxy else "DIRECT"
 
         info = WINHTTP_PROXY_INFO()
         if winhttp.WinHttpGetProxyForUrl(session, ctypes.c_wchar_p(target_url), ctypes.byref(options), ctypes.byref(info)):
-            return info.lpszProxy.split(';')[0] if info.lpszProxy else "DIRECT"
+            return info.lpszProxy if info.lpszProxy else "DIRECT"
         return "DIRECT"
     finally:
         winhttp.WinHttpCloseHandle(session)
 
-# --- Proxy Handler ---
-
 class RobustBridge(BaseHTTPRequestHandler):
     def handle_request(self):
         target_url = self.path if self.command != 'CONNECT' else f"https://{self.path}"
-        proxy_res = resolve_proxy(target_url)
+        raw_proxy = resolve_proxy(target_url)
         
-        # Parse result
-        if proxy_res == "DIRECT":
+        # --- CLEANING LOGIC ---
+        # PAC files often return "PROXY host:port; DIRECT" or "PROXY host:port"
+        # We need to strip "PROXY " and take only the first entry.
+        proxy_clean = raw_proxy.replace("PROXY ", "").replace("proxy ", "").split(';')[0].strip()
+        
+        if proxy_clean == "DIRECT":
             is_direct = True
-            if self.command == 'CONNECT':
-                p_host, _, p_port = self.path.partition(':')
-            else:
-                u = urlparse(target_url)
-                p_host, p_port = u.hostname, (u.port or 80)
+            p_host, _, p_port = self.path.partition(':')
+            p_port = p_port if p_port else (443 if self.command == 'CONNECT' else 80)
         else:
             is_direct = False
-            proxy_res = proxy_res.replace("http://", "").replace("https://", "")
-            p_host, _, p_port = proxy_res.partition(':')
-            p_port = int(p_port) if p_port else 8080
+            p_host, _, p_port = proxy_clean.partition(':')
+            p_port = p_port if p_port else 8080
 
+        print(f"[DEBUG] {self.command} {self.path} -> Proxy: {p_host}:{p_port} (Direct: {is_direct})")
         try:
             upstream = socket.create_connection((p_host, int(p_port)))
             
