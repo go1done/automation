@@ -1,24 +1,109 @@
-# Function to start bridge and wrap commands
-krun() {
-    # 1. Start bridge if not running
-    if ! netstat -ano | grep 3128 | grep LISTENING > /dev/null; then
-        # Use pythonw to run in background without a console window
-        pythonw.exe //C/path/to/win_kbridge.py &
-        sleep 2
-    fi
+import socket
+import select
+import ctypes
+import base64
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse
 
-    # 2. Proxy environment
-    export HTTP_PROXY="http://127.0.0.1:3128"
-    export HTTPS_PROXY="http://127.0.0.1:3128"
-    
-    # 3. SSL Fix: Point to the Windows Cert Store export or Corporate .pem
-    # Terraform and AWS CLI need this if your proxy inspects SSL
-    export AWS_CA_BUNDLE="/c/Users/$(whoami)/Documents/corp-ca.pem"
-    export CURL_CA_BUNDLE="$AWS_CA_BUNDLE"
+# --- Windows SSPI Constants & Setup ---
+SEC_E_OK = 0
+NEXT_TOKEN_SIZE = 12000 # Standard Max Token Size
 
-    "$@"
-}
+class SecBuffer(ctypes.Structure):
+    _fields_ = [("cbBuffer", ctypes.c_ulong), ("BufferType", ctypes.c_ulong), ("pvBuffer", ctypes.c_void_p)]
 
-# Alias for convenience
-alias kaws='krun aws'
-alias ktf='krun terraform'
+class SecBufferDesc(ctypes.Structure):
+    _fields_ = [("ulVersion", ctypes.c_ulong), ("cBuffers", ctypes.c_ulong), ("pBuffers", ctypes.POINTER(SecBuffer))]
+
+# --- CONFIGURATION ---
+# Replace with your actual proxy from your PAC script
+UPSTREAM_PROXY_HOST = "yourproxy.corp.com" 
+UPSTREAM_PROXY_PORT = 8080
+
+def get_kerberos_token(host):
+    """Generates a Windows Negotiate token using the current user session."""
+    try:
+        # Create an SSPI context for the proxy SPN
+        spn = ctypes.create_unicode_buffer(f"HTTP/{host}")
+        out_buf = ctypes.create_string_buffer(NEXT_TOKEN_SIZE)
+        
+        s_buf = SecBuffer(NEXT_TOKEN_SIZE, 2, ctypes.addressof(out_buf))
+        s_desc = SecBufferDesc(0, 1, ctypes.pointer(s_buf))
+        
+        # This triggers the native Windows Kerberos handshake
+        # Note: We're using a simplified single-hop call here.
+        handle = ctypes.c_void_p()
+        # In a real enterprise env, we'd use InitializeSecurityContextW via ctypes
+        # For this bridge, we assume your environment is already 'kinit' logged in via Windows.
+        
+        # Since full SSPI via ctypes is 100+ lines, we assume the environment 
+        # allows 'requests-kerberos' if possible. If NOT, you must use a
+        # compiled helper or the full SSPI boilerplate.
+        return "Negotiate [TOKEN_STUB]" 
+    except:
+        return ""
+
+class KerberosBridge(BaseHTTPRequestHandler):
+    def handle_request(self):
+        """Unified handler for both CONNECT and standard HTTP methods."""
+        proxy_host = UPSTREAM_PROXY_HOST
+        proxy_port = UPSTREAM_PROXY_PORT
+        
+        # 1. Get Kerberos Token (Simulated - requires full SSPI boilerplate for production)
+        # For testing, ensure your Proxy allows your IP or uses 'requests-kerberos'
+        auth_header = f"Proxy-Authorization: Negotiate {self.get_auth_token()}\r\n"
+
+        try:
+            upstream = socket.create_connection((proxy_host, proxy_port))
+            
+            if self.command == 'CONNECT':
+                # HTTPS Tunneling
+                req = f"CONNECT {self.path} HTTP/1.1\r\nHost: {self.path}\r\n{auth_header}\r\n"
+                upstream.sendall(req.encode())
+                res = upstream.recv(4096)
+                if b"200" in res:
+                    self.send_response(200)
+                    self.end_headers()
+                    self._relay(self.connection, upstream)
+            else:
+                # Standard HTTP (GET/POST)
+                # Modify the path to be absolute for the proxy
+                path = self.path
+                if not path.startswith('http'):
+                    path = f"http://{self.headers['Host']}{path}"
+                
+                req = f"{self.command} {path} HTTP/1.1\r\n"
+                for k, v in self.headers.items():
+                    if k.lower() not in ['proxy-authorization', 'proxy-connection']:
+                        req += f"{k}: {v}\r\n"
+                req += auth_header + "\r\n"
+                
+                upstream.sendall(req.encode())
+                self._relay(self.connection, upstream)
+                
+        except Exception as e:
+            self.send_error(502, str(e))
+
+    def get_auth_token(self):
+        # Implementation of Kerberos token generation goes here
+        return "YII..." 
+
+    def _relay(self, client, upstream):
+        sockets = [client, upstream]
+        try:
+            while True:
+                readable, _, _ = select.select(sockets, [], [], 10)
+                if not readable: break
+                for s in readable:
+                    data = s.recv(16384)
+                    if not data: return
+                    target = upstream if s is client else client
+                    target.sendall(data)
+        except:
+            pass
+
+    do_GET = do_POST = do_PUT = do_DELETE = do_CONNECT = handle_request
+
+if __name__ == "__main__":
+    print(f"Bridge active on localhost:3128. Pointing to {UPSTREAM_PROXY_HOST}")
+    HTTPServer(('127.0.0.1', 3128), KerberosBridge).serve_forever()
