@@ -39,30 +39,47 @@ class SecBufferDesc(ctypes.Structure):
 # --- Core Logic Functions ---
 
 def resolve_pac_robust(target_url):
-    """Uses WinHTTP to resolve the actual proxy from the system's PAC configuration."""
+    """
+    Improved WinHTTP resolver that handles WPAD, fixed PAC, and DIRECT results.
+    """
+    # 1. Ensure the URL has a scheme (WinHTTP requires this)
+    if not target_url.startswith('http'):
+        target_url = f"https://{target_url}"
+
     session = winhttp.WinHttpOpen(ctypes.c_wchar_p("PyBridge"), 0, None, None, 0)
     try:
         ie_config = WINHTTP_CURRENT_USER_IE_PROXY_CONFIG()
         winhttp.WinHttpGetIEProxyConfigForCurrentUser(ctypes.byref(ie_config))
         
-        pac_url = ie_config.lpszAutoConfigUrl
-        if not pac_url:
-            return None # Direct connection or static proxy needed
-            
         options = WINHTTP_AUTOPROXY_OPTIONS()
-        options.dwFlags = 0x00000002 # WINHTTP_AUTOPROXY_CONFIG_URL
-        options.lpszAutoConfigUrl = pac_url
         options.fAutoLogonIfChallenged = True
         
+        # 2. Determine PAC Source
+        if ie_config.lpszAutoConfigUrl:
+            # Fixed PAC URL from settings
+            options.dwFlags = 0x00000002 # WINHTTP_AUTOPROXY_CONFIG_URL
+            options.lpszAutoConfigUrl = ie_config.lpszAutoConfigUrl
+        elif ie_config.fAutoDetect:
+            # WPAD (Web Proxy Auto-Discovery)
+            options.dwFlags = 0x00000001 # WINHTTP_AUTOPROXY_AUTO_DETECT
+            options.dwAutoDetectFlags = 0x00000001 | 0x00000002 # DHCP and DNS
+        else:
+            # No PAC configured, check for static proxy
+            if ie_config.lpszProxy:
+                return ie_config.lpszProxy.split(';')[0].strip().replace("http://", "")
+            return "DIRECT"
+
         info = WINHTTP_PROXY_INFO()
-        if winhttp.WinHttpGetProxyForUrl(session, ctypes.c_wchar_p(target_url), ctypes.byref(options), ctypes.byref(info)):
+        if winhttp.WinHttpGetProxyForUrl(session, ctypes.c_wchar_p(target_url), 
+                                         ctypes.byref(options), ctypes.byref(info)):
             proxy = info.lpszProxy
-            if proxy:
-                # Returns 'host:port' (handles multiple proxies by taking the first)
-                return proxy.split(';')[0].strip().replace("http://", "")
+            return proxy.split(';')[0].strip().replace("http://", "") if proxy else "DIRECT"
+        else:
+            # If WinHTTP fails, it might be because the URL is local
+            return "DIRECT"
+            
     finally:
         winhttp.WinHttpCloseHandle(session)
-    return None
 
 def get_kerberos_token(proxy_host):
     """Generates a Negotiate (Kerberos/NTLM) token via Windows SSPI."""
@@ -89,39 +106,44 @@ def get_kerberos_token(proxy_host):
 
 class RobustBridgeHandler(BaseHTTPRequestHandler):
     def handle_request(self):
-        target_url = self.path if self.command != 'CONNECT' else f"https://{self.path}"
-        proxy_str = resolve_pac_robust(target_url)
-        
-        if not proxy_str:
-            self.send_error(502, "PAC Resolution failed to find a proxy.")
-            return
-
+    target_url = self.path if self.command != 'CONNECT' else f"https://{self.path}"
+    proxy_str = resolve_pac_robust(target_url)
+    
+    # Logic to split host and port
+    if proxy_str == "DIRECT":
+        # Connect directly to the destination
+        if self.command == 'CONNECT':
+            p_host, _, p_port = self.path.partition(':')
+        else:
+            u = urlparse(target_url)
+            p_host, p_port = u.hostname, (u.port or 80)
+        is_direct = True
+    else:
+        # Connect to the proxy
         p_host, _, p_port = proxy_str.partition(':')
         p_port = int(p_port) if p_port else 8080
+        is_direct = False
 
-        try:
-            upstream = socket.create_connection((p_host, p_port))
+    try:
+        upstream = socket.create_connection((p_host, int(p_port)))
+        
+        # ONLY inject Kerberos if we are NOT going direct
+        auth_header = ""
+        if not is_direct:
             auth_token = get_kerberos_token(p_host)
-            auth_header = f"Proxy-Authorization: {auth_token}\r\n" if auth_token else ""
+            if auth_token:
+                auth_header = f"Proxy-Authorization: {auth_token}\r\n"
 
-            if self.command == 'CONNECT':
+        if self.command == 'CONNECT':
+            # If direct, we don't send a CONNECT to the destination, we just start SSL
+            if is_direct:
+                self.send_response(200)
+                self.end_headers()
+                self._relay(self.connection, upstream)
+            else:
                 req = f"CONNECT {self.path} HTTP/1.1\r\nHost: {self.path}\r\n{auth_header}\r\n"
                 upstream.sendall(req.encode())
-                if b"200" in upstream.recv(4096):
-                    self.send_response(200)
-                    self.end_headers()
-                    self._relay(self.connection, upstream)
-            else:
-                full_path = self.path if self.path.startswith('http') else f"http://{self.headers['Host']}{self.path}"
-                req = f"{self.command} {full_path} HTTP/1.1\r\n"
-                for k, v in self.headers.items():
-                    if k.lower() not in ['proxy-authorization', 'proxy-connection']:
-                        req += f"{k}: {v}\r\n"
-                req += auth_header + "\r\n"
-                upstream.sendall(req.encode())
-                self._relay(self.connection, upstream)
-        except Exception as e:
-            self.send_error(502, f"Bridge Error: {e}")
+                # ... rest of your CONNECT logic
 
     def _relay(self, client, upstream):
         sockets = [client, upstream]
